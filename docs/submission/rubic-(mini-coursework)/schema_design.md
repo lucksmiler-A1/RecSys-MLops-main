@@ -1,0 +1,660 @@
+# Schema Design
+
+This document is the schema-as-code view of the current RecSys data platform. It covers every persisted table and governed data entity across Source, CDC, Bronze, Silver, Gold/Feature, Feast offline, and Redis online zones.
+
+The diagrams intentionally show keys, relationship columns, and important timestamps rather than repeating every descriptive attribute. The complete physical column definitions remain in these source-of-truth files:
+
+- [schemas.py (line 11)](../../../apps/data-platform/data-generator/src/schemas.py#L11), [schemas.py (line 201)](../../../apps/data-platform/data-generator/src/schemas.py#L201): 10 Source/Bronze schemas and partition fields.
+- [governance_schemas.py (line 21)](../../../apps/data-platform/src/metadata/governance_schemas.py#L21), [governance_schemas.py (line 307)](../../../apps/data-platform/src/metadata/governance_schemas.py#L307): Bronze audit columns, Silver/feature schemas, and PK metadata published to DataHub.
+- Batch feature transformations and output columns: [build_user_sequence_features.py (line 1)](../../../apps/data-platform/src/features/spark/build_user_sequence_features.py#L1), [build_user_sequence_features.py (line 63)](../../../apps/data-platform/src/features/spark/build_user_sequence_features.py#L63), [build_user_aggregate_features.py (line 1)](../../../apps/data-platform/src/features/spark/build_user_aggregate_features.py#L1), [build_user_aggregate_features.py (line 46)](../../../apps/data-platform/src/features/spark/build_user_aggregate_features.py#L46), and [build_item_features.py (line 1)](../../../apps/data-platform/src/features/spark/build_item_features.py#L1), [build_item_features.py (line 69)](../../../apps/data-platform/src/features/spark/build_item_features.py#L69).
+- [sinks/iceberg.py](../../../apps/data-platform/src/features/flink/sinks/iceberg.py): 6 streaming Iceberg table DDLs, catalog setup, row mapping, and statement-set writes.
+- [postgres_offline_store.py (line 21)](../../../apps/data-platform/src/feature_store/postgres_offline_store.py#L21), [postgres_offline_store.py (line 167)](../../../apps/data-platform/src/feature_store/postgres_offline_store.py#L167), [postgres_offline_store.py (line 213)](../../../apps/data-platform/src/feature_store/postgres_offline_store.py#L213): PostgreSQL offline-store schemas and write helpers.
+- [recsys_feature_definitions.py](../../../apps/data-platform/feature-store/feature_repo/recsys_feature_definitions.py): Feast entities, PostgreSQL sources, FeatureViews, timestamps, and services.
+
+## Complete Table Inventory
+
+| Zone | Count | Current entities |
+|---|---:|---|
+| Source PostgreSQL | 10 | `users`, `user_preferences`, `products`, `product_snapshots`, `sessions`, `recommendation_requests`, `impressions`, `behavior_events`, `orders`, `order_items` |
+| CDC Kafka | 10 | `cdc.users`, `cdc.user_preferences`, `cdc.products`, `cdc.product_snapshots`, `cdc.sessions`, `cdc.recommendation_requests`, `cdc.impressions`, `cdc.behavior_events`, `cdc.orders`, `cdc.order_items` |
+| Bronze Iceberg | 10 | `bronze_users`, `bronze_user_preferences`, `bronze_products`, `bronze_product_snapshots`, `bronze_sessions`, `bronze_recommendation_requests`, `bronze_impressions`, `bronze_behavior_events`, `bronze_orders`, `bronze_order_items` |
+| Silver Iceberg | 8 | `silver_clean_behavior_events`, `silver_rejected_behavior_events`, `silver_clean_impressions`, `silver_clean_recommendation_requests`, `silver_product_scd`, `silver_users`, `silver_products`, `silver_user_preferences` |
+| Gold batch Iceberg | 5 | `user_sequence_features`, `user_aggregate_features`, `item_features`, `ml_ranking_labels`, `ml_bst_training` |
+| Gold streaming Iceberg | 6 | `stream_behavior_events`, `stream_user_sequence_features`, `stream_user_aggregate_features`, `stream_item_features`, `streaming_quality_windows`, `stream_late_events_dlq` |
+| Feast PostgreSQL offline | 4 | `user_sequence_features`, `user_aggregate_features`, `item_features`, `ml_ranking_labels` |
+| Redis online | 3 | `fs:user_sequence:{user_id}`, `fs:user_aggregate:{user_id}`, `fs:item:{product_id}` |
+
+Total data entities shown below: 56. PostgreSQL and Redis feature entities are physical serving copies of the matching Gold feature outputs, not additional feature definitions.
+
+## Naming Convention
+
+| Logical role | Current convention | Examples |
+|---|---|---|
+| Source | Business table name | `users`, `behavior_events` |
+| CDC | `cdc.<source_table>` | `cdc.behavior_events` |
+| Bronze | `recsys.lakehouse.bronze_<source_table>` in the Iceberg catalog and DataHub | `bronze_orders` |
+| Silver dimension | `silver_<entity>` or `silver_<entity>_scd` | `silver_users`, `silver_product_scd` |
+| Silver clean/reject | `silver_clean_<subject>`, `silver_rejected_<subject>` | `silver_clean_behavior_events` |
+| Gold features | `<entity>_<feature_family>_features` | `user_sequence_features`, `item_features` |
+| ML artifacts | `ml_<purpose>` | `ml_ranking_labels`, `ml_bst_training` |
+| Streaming | `stream_<subject>` or `streaming_<subject>` | `stream_item_features`, `streaming_quality_windows` |
+| Online key | `fs:<feature_view>:<entity_key>` | `fs:user_aggregate:42` |
+
+This is equivalent to the rubric's `dim_` and `feat_` convention: the repository expresses those roles with `silver_*_scd` and `*_features`. The order-item fact is built in the Analytics Gold layer directly from `bronze_orders` and `bronze_order_items`, so DP2 does not persist a redundant `silver_order_facts` table.
+
+## All Zones Overview
+
+```mermaid
+flowchart LR
+  SRC["SOURCE POSTGRESQL — 10<br/>users<br/>user_preferences<br/>products<br/>product_snapshots<br/>sessions<br/>recommendation_requests<br/>impressions<br/>behavior_events<br/>orders<br/>order_items"]
+  CDC["CDC KAFKA — 10<br/>cdc.users<br/>cdc.user_preferences<br/>cdc.products<br/>cdc.product_snapshots<br/>cdc.sessions<br/>cdc.recommendation_requests<br/>cdc.impressions<br/>cdc.behavior_events<br/>cdc.orders<br/>cdc.order_items"]
+  BRONZE["BRONZE PARQUET — 10<br/>bronze_users<br/>bronze_user_preferences<br/>bronze_products<br/>bronze_product_snapshots<br/>bronze_sessions<br/>bronze_recommendation_requests<br/>bronze_impressions<br/>bronze_behavior_events<br/>bronze_orders<br/>bronze_order_items"]
+  SILVER["SILVER ICEBERG — 8<br/>silver_users<br/>silver_user_preferences<br/>silver_products<br/>silver_product_scd<br/>silver_clean_recommendation_requests<br/>silver_clean_impressions<br/>silver_clean_behavior_events<br/>silver_rejected_behavior_events"]
+  BATCH["GOLD BATCH ICEBERG — 5<br/>user_sequence_features<br/>user_aggregate_features<br/>item_features<br/>ml_ranking_labels<br/>ml_bst_training"]
+  STREAM["GOLD STREAMING ICEBERG — 6<br/>stream_behavior_events<br/>stream_user_sequence_features<br/>stream_user_aggregate_features<br/>stream_item_features<br/>streaming_quality_windows<br/>stream_late_events_dlq"]
+  PG["FEAST POSTGRESQL — 4<br/>user_sequence_features<br/>user_aggregate_features<br/>item_features<br/>ml_ranking_labels"]
+  REDIS["REDIS ONLINE — 3<br/>fs:user_sequence:{user_id}<br/>fs:user_aggregate:{user_id}<br/>fs:item:{product_id}"]
+
+  SRC -->|"Debezium WAL"| CDC
+  SRC -->|"DP1 batch ingestion"| BRONZE
+  BRONZE -->|"DP2 Spark clean and conform"| SILVER
+  SILVER -->|"DP3 Spark features and labels"| BATCH
+  CDC -->|"Flink event-time processing"| STREAM
+  BATCH -->|"batch export"| PG
+  CDC -->|"streaming upsert"| PG
+  PG -->|"Feast materialization"| REDIS
+  CDC -->|"direct Flink online update"| REDIS
+```
+
+## Source And Bronze ERD
+
+Bronze preserves the same business columns and logical relationships as Source, then adds `source_run_id` and `lakehouse_ingestion_ts` to every table. PostgreSQL currently enforces primary keys; the FK lines below are logical data-contract relationships used by Spark joins and DataHub lineage.
+
+```mermaid
+erDiagram
+  USERS {
+    bigint user_id PK
+    timestamp signup_ts
+    bigint preferred_category_id
+    bigint preferred_brand_id
+    timestamp created_ts
+    timestamp updated_ts
+  }
+
+  USER_PREFERENCES {
+    bigint user_id PK, FK
+    bigint category_id PK
+    bigint brand_id PK
+    double preference_weight
+    timestamp created_ts
+    timestamp updated_ts
+  }
+
+  PRODUCTS {
+    bigint product_id PK
+    bigint category_id
+    bigint brand_id
+    decimal current_price
+    smallint price_bucket
+    boolean is_active
+    timestamp created_ts
+    timestamp updated_ts
+  }
+
+  PRODUCT_SNAPSHOTS {
+    bigint product_id PK, FK
+    timestamp valid_from PK
+    timestamp valid_to
+    bigint category_id
+    bigint brand_id
+    decimal current_price
+    boolean is_active
+    timestamp created_ts
+  }
+
+  SESSIONS {
+    string session_id PK
+    bigint user_id FK
+    timestamp session_start_ts
+    timestamp session_end_ts
+    timestamp created_ts
+  }
+
+  RECOMMENDATION_REQUESTS {
+    string request_id PK
+    bigint user_id FK
+    string session_id FK
+    bigint context_product_id FK
+    timestamp request_timestamp
+    timestamp created_ts
+  }
+
+  IMPRESSIONS {
+    string impression_id PK
+    string request_id FK
+    bigint user_id FK
+    string session_id FK
+    bigint candidate_product_id FK
+    timestamp impression_timestamp
+    boolean is_clicked
+    timestamp created_ts
+  }
+
+  BEHAVIOR_EVENTS {
+    string event_id PK
+    string payload_hash PK
+    bigint user_id FK
+    string session_id FK
+    string request_id FK
+    string impression_id FK
+    bigint product_id FK
+    string order_id FK
+    string event_type
+    timestamp event_timestamp
+    timestamp created_ts
+    timestamp ingestion_ts
+  }
+
+  ORDERS {
+    string order_id PK
+    bigint user_id FK
+    string session_id FK
+    timestamp order_timestamp
+    string status
+    decimal net_amount
+    timestamp created_ts
+    timestamp updated_ts
+  }
+
+  ORDER_ITEMS {
+    string order_item_id PK
+    string order_id FK
+    bigint product_id FK
+    int quantity
+    decimal unit_price
+    decimal line_amount
+    timestamp created_ts
+  }
+
+  USERS ||--o{ USER_PREFERENCES : has
+  USERS ||--o{ SESSIONS : starts
+  USERS ||--o{ RECOMMENDATION_REQUESTS : requests
+  USERS ||--o{ IMPRESSIONS : sees
+  USERS ||--o{ BEHAVIOR_EVENTS : generates
+  USERS ||--o{ ORDERS : places
+  PRODUCTS ||--o{ PRODUCT_SNAPSHOTS : versions
+  PRODUCTS o|--o{ RECOMMENDATION_REQUESTS : context_product
+  PRODUCTS ||--o{ IMPRESSIONS : candidate_product
+  PRODUCTS ||--o{ BEHAVIOR_EVENTS : interacted_product
+  PRODUCTS ||--o{ ORDER_ITEMS : purchased_product
+  SESSIONS ||--o{ RECOMMENDATION_REQUESTS : contains
+  SESSIONS ||--o{ IMPRESSIONS : contains
+  SESSIONS ||--o{ BEHAVIOR_EVENTS : contains
+  SESSIONS o|--o{ ORDERS : converts_to
+  RECOMMENDATION_REQUESTS ||--o{ IMPRESSIONS : returns
+  RECOMMENDATION_REQUESTS o|--o{ BEHAVIOR_EVENTS : attributed_request
+  IMPRESSIONS o|--o{ BEHAVIOR_EVENTS : attributed_impression
+  ORDERS o|--o{ BEHAVIOR_EVENTS : purchase_event
+  ORDERS ||--|{ ORDER_ITEMS : contains
+```
+
+### Bronze physical schema proof
+
+The DBeaver detailed ERD below confirms the 10 live Bronze objects and exposes their full physical
+column sets. The relationship lines are DBeaver-local logical foreign keys used to document join
+semantics; Iceberg does not enforce them as physical constraints.
+
+![DBeaver Bronze detailed ERD showing all 10 tables and their columns](../../pngs/dbeaver-bronze-schema-detailed-20260804.png)
+
+*Runtime note — captured from the production GKE lakehouse on 2026-08-04 through the internal
+Spark Thrift JDBC boundary. Each Bronze object retains the source business columns and adds the
+ingestion audit fields described above.*
+
+## Silver, Dimension, Fact, And Gold Feature ERD
+
+Iceberg does not enforce foreign keys. These lines document transformation lineage and join semantics. Composite `PK` labels are the logical uniqueness contracts published to DataHub.
+
+```mermaid
+erDiagram
+  SILVER_USERS {
+    bigint user_id PK
+    timestamp signup_ts
+    timestamp created_ts
+    timestamp updated_ts
+  }
+
+  SILVER_USER_PREFERENCES {
+    bigint user_id PK, FK
+    bigint category_id PK
+    bigint brand_id PK
+    double preference_weight
+  }
+
+  SILVER_PRODUCTS {
+    bigint product_id PK
+    bigint category_id
+    bigint brand_id
+    decimal current_price
+    boolean is_active
+  }
+
+  SILVER_PRODUCT_SCD {
+    bigint product_id PK, FK
+    timestamp valid_from PK
+    timestamp valid_to
+    boolean is_current
+    bigint category_id
+    bigint brand_id
+    decimal current_price
+    boolean is_active
+  }
+
+  SILVER_CLEAN_REQUESTS {
+    string request_id PK
+    bigint user_id FK
+    string session_id FK
+    timestamp request_timestamp
+    string request_context
+  }
+
+  SILVER_CLEAN_IMPRESSIONS {
+    string impression_id PK
+    string request_id FK
+    bigint user_id FK
+    bigint candidate_product_id FK
+    timestamp impression_timestamp
+  }
+
+  SILVER_CLEAN_BEHAVIOR_EVENTS {
+    string event_id PK
+    bigint user_id FK
+    bigint product_id FK
+    string request_id FK
+    string impression_id FK
+    string order_id FK
+    timestamp event_timestamp
+    timestamp ingestion_ts
+    smallint event_type_id
+  }
+
+  SILVER_REJECTED_BEHAVIOR_EVENTS {
+    string event_id
+    string payload_hash
+    timestamp event_timestamp
+    timestamp ingestion_ts
+  }
+
+  USER_SEQUENCE_FEATURES {
+    bigint user_id PK, FK
+    timestamp feature_timestamp PK
+    timestamp event_timestamp
+    timestamp created_timestamp
+    array hist_item_ids
+    array hist_event_type_ids
+    bigint hist_length
+    string feature_version
+  }
+
+  USER_AGGREGATE_FEATURES {
+    bigint user_id PK, FK
+    timestamp feature_timestamp PK
+    timestamp event_timestamp
+    timestamp created_timestamp
+    bigint views_30m
+    bigint carts_30m
+    bigint purchases_24h
+    double cart_to_purchase_ratio_7d
+    string feature_version
+  }
+
+  ITEM_FEATURES {
+    bigint product_id PK, FK
+    timestamp feature_timestamp PK
+    timestamp event_timestamp
+    timestamp created_timestamp
+    bigint views_1h
+    bigint views_24h
+    bigint purchases_24h
+    double conversion_rate_7d
+    double popularity_score
+    string feature_version
+  }
+
+  ML_RANKING_LABELS {
+    string impression_id PK, FK
+    bigint candidate_product_id PK, FK
+    string request_id FK
+    bigint user_id FK
+    timestamp prediction_timestamp
+    timestamp label_window_end
+    int label
+    timestamp created_timestamp
+  }
+
+  ML_BST_TRAINING {
+    string impression_id PK, FK
+    bigint target_item_id PK, FK
+    string request_id FK
+    bigint user_id FK
+    array hist_item_id
+    timestamp prediction_timestamp
+    int label
+    bigint views_30m
+    bigint carts_30m
+  }
+
+  SILVER_USERS ||--o{ SILVER_USER_PREFERENCES : dimension
+  SILVER_USERS ||--o{ SILVER_CLEAN_REQUESTS : dimension
+  SILVER_USERS ||--o{ SILVER_CLEAN_IMPRESSIONS : dimension
+  SILVER_USERS ||--o{ SILVER_CLEAN_BEHAVIOR_EVENTS : dimension
+  SILVER_PRODUCTS ||--o{ SILVER_PRODUCT_SCD : SCD2_versions
+  SILVER_PRODUCTS ||--o{ SILVER_CLEAN_IMPRESSIONS : candidate
+  SILVER_PRODUCTS ||--o{ SILVER_CLEAN_BEHAVIOR_EVENTS : interacted_item
+  SILVER_CLEAN_REQUESTS ||--o{ SILVER_CLEAN_IMPRESSIONS : returns
+  SILVER_CLEAN_REQUESTS o|--o{ SILVER_CLEAN_BEHAVIOR_EVENTS : attribution
+  SILVER_CLEAN_IMPRESSIONS o|--o{ SILVER_CLEAN_BEHAVIOR_EVENTS : attribution
+  SILVER_USERS ||--o{ USER_SEQUENCE_FEATURES : entity_features
+  SILVER_USERS ||--o{ USER_AGGREGATE_FEATURES : entity_features
+  SILVER_PRODUCT_SCD ||--o{ ITEM_FEATURES : point_in_time_dimension
+  SILVER_CLEAN_BEHAVIOR_EVENTS ||--o{ USER_SEQUENCE_FEATURES : builds
+  SILVER_CLEAN_BEHAVIOR_EVENTS ||--o{ USER_AGGREGATE_FEATURES : builds
+  SILVER_CLEAN_BEHAVIOR_EVENTS ||--o{ ITEM_FEATURES : builds
+  SILVER_CLEAN_IMPRESSIONS ||--o{ ML_RANKING_LABELS : candidate_labels
+  SILVER_CLEAN_BEHAVIOR_EVENTS ||--o{ ML_RANKING_LABELS : positive_labels
+  USER_SEQUENCE_FEATURES ||--o{ ML_BST_TRAINING : point_in_time_join
+  USER_AGGREGATE_FEATURES ||--o{ ML_BST_TRAINING : point_in_time_join
+  ITEM_FEATURES ||--o{ ML_BST_TRAINING : point_in_time_join
+  ML_RANKING_LABELS ||--o{ ML_BST_TRAINING : training_labels
+```
+
+### Silver physical schema proof
+
+This DBeaver view confirms the eight live Silver objects: four conformed dimensions/bridges, three
+clean request/impression/event tables, and the rejected-event quarantine table. It also makes the
+`silver_product_scd` validity interval and the clean/reject split visible at column level.
+
+![DBeaver Silver detailed ERD showing all 8 tables and their columns](../../pngs/dbeaver-silver-schema-detailed-20260804.png)
+
+*Runtime note — the diagram contains no `silver_order_facts`; Analytics derives its order-item fact
+directly from the Bronze `orders` and `order_items` inputs.*
+
+### Gold feature and training schema proof
+
+The five live Gold objects below separate reusable entity features, ranking labels, and the final
+BST training dataset. The connectors visualize the point-in-time feature and label joins expressed
+by the logical ERD above.
+
+![DBeaver Gold detailed ERD showing feature, label, and BST training tables](../../pngs/dbeaver-gold-feature-schema-detailed-20260804.png)
+
+*Runtime note — array-valued history fields belong to `gold_user_sequence_features`; aggregate and
+item features remain scalar so Feast can materialize the corresponding online feature views.*
+
+### SCD2 dimension semantics
+
+The physical Source and Silver columns are `valid_from` and `valid_to`. A `NULL valid_to` is the current-row flag. The ERD exposes `is_current` as the following deterministic derived field, matching the coursework terminology without claiming that Source PostgreSQL stores a third physical column:
+
+```sql
+SELECT
+  product_id,
+  valid_from,
+  valid_to,
+  valid_to IS NULL AS is_current,
+  category_id,
+  brand_id,
+  current_price,
+  price_bucket,
+  is_active
+FROM recsys.lakehouse.silver_product_scd;
+```
+
+Point-in-time usage:
+
+```sql
+SELECT f.*, d.category_id, d.brand_id, d.price_bucket
+FROM fact_behavior_events AS f
+JOIN dim_product_scd AS d
+  ON f.product_id = d.product_id
+ AND f.event_timestamp >= d.valid_from
+ AND (f.event_timestamp < d.valid_to OR d.valid_to IS NULL);
+```
+
+## Feature Timestamp Contract
+
+The three Feast FeatureViews satisfy the required two-time-column design. `feature_timestamp` is the point-in-time lookup field, `event_timestamp` preserves business event time, and `created_timestamp` supports deduplication when rows share the same event time.
+
+| Feature table | Entity key | Event-time fields | Created field | Physical stores |
+|---|---|---|---|---|
+| `user_sequence_features` | `user_id` | `feature_timestamp`, `event_timestamp` | `created_timestamp` | Iceberg, PostgreSQL, Redis |
+| `user_aggregate_features` | `user_id` | `feature_timestamp`, `event_timestamp` | `created_timestamp` | Iceberg, PostgreSQL, Redis |
+| `item_features` | `product_id` | `feature_timestamp`, `event_timestamp` | `created_timestamp` | Iceberg, PostgreSQL, Redis |
+| `ml_ranking_labels` | `impression_id`, `candidate_product_id` | `prediction_timestamp`, `positive_event_timestamp` | `created_timestamp` | Iceberg, PostgreSQL |
+| `ml_bst_training` | `impression_id`, `target_item_id` | `prediction_timestamp`, `event_time` | Not applicable: immutable training artifact | Iceberg |
+
+The streaming Iceberg projections use `feature_timestamp` as their event-time field. `streaming_quality_windows` and `stream_late_events_dlq` also persist `created_timestamp`; the compact streaming feature projections deliberately keep processing metadata inside `feature_payload`.
+
+## Streaming And Serving Relationships
+
+```mermaid
+flowchart LR
+  K["cdc.behavior_events"]
+
+  SBE["stream_behavior_events<br/>event_id, user_id, product_id<br/>event_timestamp, processed_timestamp"]
+  SSQ["stream_user_sequence_features<br/>user_id, feature_timestamp<br/>sequence_length, feature_payload"]
+  SAGG["stream_user_aggregate_features<br/>user_id, feature_timestamp<br/>views_30m, carts_30m, purchases_24h"]
+  SITEM["stream_item_features<br/>product_id, feature_timestamp<br/>views_1h, views_24h, popularity_score"]
+  SQ["streaming_quality_windows<br/>window_start, window_end<br/>late/duplicate/burst metrics<br/>created_timestamp"]
+  DLQ["stream_late_events_dlq<br/>event_id, user_id, product_id<br/>event_timestamp, reason<br/>created_timestamp"]
+
+  ISEQ["Iceberg user_sequence_features"]
+  IAGG["Iceberg user_aggregate_features"]
+  IITEM["Iceberg item_features"]
+  ILABEL["Iceberg ml_ranking_labels"]
+
+  PSEQ["PostgreSQL user_sequence_features"]
+  PAGG["PostgreSQL user_aggregate_features"]
+  PITEM["PostgreSQL item_features"]
+  PLABEL["PostgreSQL ml_ranking_labels"]
+
+  RSEQ["Redis fs:user_sequence:{user_id}"]
+  RAGG["Redis fs:user_aggregate:{user_id}"]
+  RITEM["Redis fs:item:{product_id}"]
+
+  K --> SBE
+  K --> SSQ
+  K --> SAGG
+  K --> SITEM
+  K --> SQ
+  K --> DLQ
+
+  ISEQ -->|"batch export"| PSEQ
+  IAGG -->|"batch export"| PAGG
+  IITEM -->|"batch export"| PITEM
+  ILABEL -->|"batch export"| PLABEL
+
+  K -->|"Flink upsert"| PSEQ
+  K -->|"Flink upsert"| PAGG
+  K -->|"Flink upsert"| PITEM
+  PSEQ -->|"Feast materialize"| RSEQ
+  PAGG -->|"Feast materialize"| RAGG
+  PITEM -->|"Feast materialize"| RITEM
+  K -->|"direct online update"| RSEQ
+  K -->|"direct online update"| RAGG
+  K -->|"direct online update"| RITEM
+```
+
+## Analytics Semantic Schema ERD
+
+The Analytics layer reads the synchronized Bronze/Silver subjects and publishes dimensional facts
+and daily marts. The live DBeaver ERD below shows all 14 objects: eight staging tables, three core
+tables, and three reporting marts. Purple, yellow, and orange headers distinguish staging,
+core/fact, and mart roles in the custom diagram.
+
+![DBeaver Analytics detailed ERD showing staging, core, fact, and mart tables](../../pngs/dbeaver-analytics-schema-detailed-20260804.png)
+
+*Runtime note — `fct_order_items` joins `orders` with `order_items`; `fct_recommendation_impressions`
+connects recommendation exposure to product context; the daily marts aggregate those governed
+facts for experiment, product-performance, and funnel analysis.*
+
+## Complete Transformation Lineage
+
+| Output | Direct upstream table(s) | Relationship |
+|---|---|---|
+| Every `cdc.<table>` | Matching Source PostgreSQL `<table>` | Debezium after-image of the same primary-keyed entity. |
+| Every `bronze_<table>` | Matching generated Source `<table>` | One-to-one raw schema plus `source_run_id` and `lakehouse_ingestion_ts`. |
+| `silver_clean_behavior_events` | `bronze_behavior_events` | Normalize timestamps, derive `event_type_id`, and apply `.dropDuplicates(["event_id"])`. |
+| `silver_rejected_behavior_events` | `bronze_behavior_events` | Quarantine rows with unsupported behavior-event schema versions. |
+| `silver_clean_impressions` | `bronze_impressions` | Timestamp normalization and `impression_id` deduplication. |
+| `silver_clean_recommendation_requests` | `bronze_recommendation_requests` | Timestamp normalization and `request_context` defaulting. |
+| `silver_product_scd` | `bronze_product_snapshots`, fallback `bronze_products` | SCD2 dimension on `product_id`, `valid_from`, `valid_to`. |
+| `silver_users` | `bronze_users` | Conformed user dimension. |
+| `silver_products` | `bronze_products` | Conformed current-product dimension. |
+| `silver_user_preferences` | `bronze_user_preferences` | Conformed bridge between users and category/brand preferences. |
+| `user_sequence_features` | `silver_clean_behavior_events` | Bounded per-user event history. |
+| `user_aggregate_features` | `silver_clean_behavior_events` | Per-user 30-minute, 24-hour, and 7-day windows. |
+| `item_features` | `silver_clean_behavior_events`, `silver_product_scd` | Per-product windows enriched with point-in-time product attributes. |
+| `ml_ranking_labels` | `silver_clean_impressions`, `silver_clean_behavior_events` | Impression candidates labeled by later cart/purchase events. |
+| `ml_bst_training` | All three batch feature tables and `ml_ranking_labels` | Point-in-time feature joins at `prediction_timestamp`. |
+| Analytics `fct_order_items` | `bronze_orders`, `bronze_order_items` | Analytics sync copies both Bronze inputs; dbt joins on `order_id` and derives `is_valid_purchase` without persisting a Silver fact table. |
+| All six streaming Iceberg tables | `cdc.behavior_events` | Flink event-time processing, quality windows, and late-event routing. |
+| Four PostgreSQL offline tables | Matching Iceberg batch table; three feature tables also receive streaming upserts | Feast historical retrieval and materialization source. |
+| Three Redis online keys | Matching PostgreSQL FeatureView or direct Flink feature update | Latest entity features for low-latency serving. |
+
+## Runtime Schema Proof In DBeaver
+
+DBeaver was connected to the production GKE lakehouse on **2026-08-04** through two internal
+JDBC query boundaries. Neither service has a public load balancer:
+
+```text
+DBeaver Hive JDBC                         DBeaver Trino JDBC
+  -> localhost:19000                        -> localhost:18080
+  -> recsys-lakehouse-thrift:10000          -> recsys-analytics-trino:8080
+  -> Spark Hadoop Iceberg catalogs          -> Trino JDBC Iceberg catalog
+  -> Bronze / Silver / Gold                 -> Analytics staging / core / recsys
+                         -> MinIO Iceberg metadata and Parquet
+```
+
+The deployed `recsys-analytics` Helm release was revision **23** and both
+`recsys-lakehouse-thrift` and `recsys-analytics-trino` were `Ready 1/1`. The
+`recsys-data-config` release was revision **22**. Both releases reference
+`recsys-spark:retire-order-facts-20260804-v2`; the data and analytics releases also retain
+`recsys-analytics-dbt:retire-order-facts-20260804`. Consequently, future Airflow, Spark, and dbt
+runs use the source graph that builds Analytics `fct_order_items` from Bronze `orders` and
+`order_items`, rather than recreating `order_facts`.
+
+### Live ERD proof
+
+The custom DBeaver ERD below contains **37 live objects** loaded from the two JDBC connections:
+
+- 10 Bronze views over `recsys.lakehouse.bronze_*`;
+- 8 Silver views over `recsys.lakehouse.silver_*`;
+- 5 Gold views over `recsys_features.feature_store`;
+- 14 Analytics tables: 8 `staging`, 3 `core`, and 3 `recsys` marts.
+
+Orange, blue, green, purple, and yellow distinguish Bronze, Silver, offline Gold, Analytics
+staging, and Analytics core/marts. The dotted connectors are DBeaver-local logical foreign keys;
+they do not mutate Iceberg metadata. The diagram deliberately has no `silver_order_facts` or
+Analytics `staging.order_facts` entity.
+
+![DBeaver live ERD for Bronze, Silver, Gold, and Analytics](../../pngs/dbeaver-lakehouse-erd-proof.png)
+
+The overview intentionally collapses attributes so all 37 objects remain readable. The four
+**Show Attributes: All** captures are embedded next to their corresponding Bronze, Silver, Gold,
+and Analytics schema sections above, where the physical columns can be compared directly with the
+logical contracts.
+
+Spark's HiveServer2 JDBC metadata API enumerates the built-in `global_temp` namespace rather than
+Spark V2 catalogs. The Helm-managed
+[bootstrap ConfigMap](../../../infra/helm/recsys-analytics/templates/lakehouse-thrift-bootstrap-configmap.yaml)
+therefore creates 23 read-only `GLOBAL TEMP VIEW ... AS SELECT *` bridges when the Thrift pod
+starts. They copy no data and disappear with the Spark application; the bootstrap recreates them
+on every rollout. The DBeaver navigator capture below shows the live Bronze, Silver, and
+Gold inventory and the absence of `silver_order_facts`:
+
+![DBeaver live Spark Thrift views](../../pngs/dbeaver-lakehouse-live-views-proof.png)
+
+### Iceberg table-format proof
+
+The Trino connection exposes the JDBC-backed Analytics catalog. The following capture queries
+`clean_behavior_events$snapshots`; the eight returned snapshot IDs and `overwrite` operations
+prove that the object is an Iceberg table, not merely a JDBC table list or raw Parquet directory.
+
+![DBeaver Trino query showing Iceberg snapshots](../../pngs/dbeaver-iceberg-snapshots-proof.png)
+
+The query used for the capture was:
+
+```sql
+SELECT
+  current_user AS trino_user,
+  current_catalog AS iceberg_catalog,
+  current_schema AS semantic_schema,
+  table_schema,
+  table_name
+FROM analytics.information_schema.tables
+WHERE table_schema IN ('staging', 'core', 'recsys')
+ORDER BY table_schema, table_name;
+
+SELECT
+  committed_at,
+  snapshot_id,
+  parent_id,
+  operation,
+  summary
+FROM analytics.staging."clean_behavior_events$snapshots"
+ORDER BY committed_at DESC
+LIMIT 10;
+```
+
+### Verified retirement of `order_facts`
+
+The migration first synchronized the replacement inputs and ran the full Analytics dbt build:
+
+| Check | Production result |
+|---|---|
+| Analytics sync | `orders=115`, `order_items=115`; all eight source tables copied successfully |
+| dbt build | `PASS=31`, `WARN=0`, `ERROR=0` |
+| Replacement fact | `analytics.core.fct_order_items=115` rows |
+| Post-drop Spark inventory | 18 operational tables: 10 Bronze + 8 Silver; no `silver_order_facts` |
+| Post-drop Analytics inventory | `staging.order_facts` absent; 8 staging + 3 core + 3 recsys tables remain |
+
+The two explicitly removed managed Iceberg tables were:
+
+| Dropped table | Pre-drop rows | Last recorded snapshot | Last recorded location |
+|---|---:|---|---|
+| `recsys.lakehouse.silver_order_facts` | 115 | `2409065848362401434` | `s3a://recsys-lakehouse/warehouse/lakehouse/silver_order_facts` |
+| `analytics.staging.order_facts` | 115 | `5576655651108755219` | `s3a://recsys-lakehouse/analytics/staging/order_facts` |
+
+`DROP TABLE` on a managed Iceberg table can purge its metadata and data files. The snapshot IDs
+above are an audit record, not a guaranteed restore point; recovery now depends on independent
+object-store backup/versioning. This is intentional because both obsolete facts were replaced and
+the user authorized their production removal.
+
+### Reproduce the DBeaver connections
+
+Create both local tunnels without exposing either service publicly:
+
+```bash
+kubectl -n analytics port-forward svc/recsys-lakehouse-thrift 19000:10000
+kubectl -n analytics port-forward svc/recsys-analytics-trino 18080:8080
+```
+
+Create these connections in DBeaver:
+
+| Layer | DBeaver driver | JDBC URL | User |
+|---|---|---|---|
+| Bronze / Silver / Gold | Apache Hive | `jdbc:hive2://localhost:19000/lakehouse` | `dbeaver` |
+| Analytics | Trino | `jdbc:trino://localhost:18080/analytics/recsys` | `dbt` |
+
+The internal Trino coordinator uses the Trino user header plus file-based authorization, so the
+current proof connection has no password. Production access remains protected by the `ClusterIP`
+service boundary and the user's Kubernetes credentials. The implementation follows the official
+[DBeaver Trino driver guide](https://dbeaver.com/docs/dbeaver/Database-driver-Trino/),
+[Trino JDBC specification](https://trino.io/docs/current/client/jdbc.html),
+[Trino Iceberg connector documentation](https://trino.io/docs/current/connector/iceberg.html),
+[Spark Thrift JDBC/ODBC guide](https://spark.apache.org/docs/latest/sql-distributed-sql-engine.html),
+and [Iceberg Spark catalog configuration](https://iceberg.apache.org/docs/latest/spark-configuration/).
+
+Iceberg also does not persist primary-key or foreign-key constraints. Consequently, a schema
+diagram opened from live Iceberg metadata cannot infer the logical relationship lines documented
+above. DBeaver custom diagrams store those virtual relationships locally without altering the
+lakehouse. See the official [DBeaver custom diagram guide](https://dbeaver.com/docs/dbeaver/Custom-Diagrams/)
+and [ER diagram guide](https://dbeaver.com/docs/dbeaver/ER-Diagrams/) for the same workflow.

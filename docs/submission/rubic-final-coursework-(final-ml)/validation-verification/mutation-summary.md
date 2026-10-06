@@ -1,0 +1,11 @@
+# Mutation Testing
+
+- Mutation score: 86.67%
+- Gate: > 80.00%
+- Killed: 52
+- Survived: 8
+- Timeout: 0
+- Suspicious: 0
+- No tests: 0
+- Targets: apps/api-serving/src/online_features.py, apps/api-serving/src/ranking.py
+- Mutant filters: ranking.x_format_top_k*, online_features.x_get_online_features*

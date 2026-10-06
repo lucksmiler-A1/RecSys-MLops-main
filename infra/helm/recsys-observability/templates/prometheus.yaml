@@ -1,0 +1,285 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: recsys-prometheus
+  namespace: {{ .Values.namespace.name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: recsys-prometheus
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["extensions", "networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: recsys-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: recsys-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: recsys-prometheus
+    namespace: {{ .Values.namespace.name }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recsys-prometheus-config
+  namespace: {{ .Values.namespace.name }}
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+    scrape_configs:
+      # API workloads are scraped once per annotated pod by recsys-kubernetes-pods.
+      # Scraping their ClusterIP services as well would duplicate counters and make rates unstable.
+      - job_name: recsys-pushgateway
+        honor_labels: true
+        static_configs:
+          - targets: ["recsys-pushgateway.{{ .Values.namespace.name }}.svc.cluster.local:9091"]
+      - job_name: recsys-redis-exporter
+        static_configs:
+          - targets: ["redis-exporter.{{ .Values.namespace.name }}.svc.cluster.local:9121"]
+      - job_name: recsys-source-postgres-exporter
+        static_configs:
+          - targets: ["source-postgres-exporter.{{ .Values.namespace.name }}.svc.cluster.local:9187"]
+      - job_name: recsys-warehouse-postgres-exporter
+        static_configs:
+          - targets: ["warehouse-postgres-exporter.{{ .Values.namespace.name }}.svc.cluster.local:9187"]
+      - job_name: kubernetes-cadvisor
+        scheme: https
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          insecure_skip_verify: true
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics/cadvisor
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+      - job_name: kubernetes-kubelet
+        scheme: https
+        bearer_token_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        tls_config:
+          insecure_skip_verify: true
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - target_label: __address__
+            replacement: kubernetes.default.svc:443
+          - source_labels: [__meta_kubernetes_node_name]
+            regex: (.+)
+            target_label: __metrics_path__
+            replacement: /api/v1/nodes/$1/proxy/metrics
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+      - job_name: recsys-kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - {{ .Values.targets.apiNamespace }}
+                - {{ .Values.targets.dataNamespace }}
+                - {{ .Values.targets.kserveNamespace }}
+                - {{ .Values.targets.mlflowNamespace }}
+                - {{ .Values.targets.kubeflowNamespace }}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: recsys-prometheus-rules
+  namespace: {{ .Values.namespace.name }}
+data:
+  recsys-alerts.yml: |
+    groups:
+      - name: recsys-observability
+        rules:
+          - alert: RecSysApiHighFailureRate
+            expr: sum(rate(recsys_api_failures_total[5m])) > 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: RecSys API is returning failures.
+          - alert: RecSysFeatureDriftDetected
+            expr: min(recsys_ml_feature_drift_passed) == 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: Offline feature drift threshold failed.
+          - alert: RecSysDataQualityFailed
+            expr: min(recsys_data_quality_passed) == 0
+            for: 1m
+            labels:
+              severity: warning
+            annotations:
+              summary: Data quality validation failed.
+          - alert: RecSysABCandidateErrorRegression
+            expr: |
+              (
+                sum(rate(model_predictions_total{ab_variant="candidate",status="error"}[5m]))
+                / clamp_min(sum(rate(model_predictions_total{ab_variant="candidate"}[5m])), 0.001)
+              )
+              >
+              (
+                sum(rate(model_predictions_total{ab_variant="control",status="error"}[5m]))
+                / clamp_min(sum(rate(model_predictions_total{ab_variant="control"}[5m])), 0.001)
+                + 0.02
+              )
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: Candidate model error rate is higher than control.
+          - alert: RecSysABCandidateLatencyRegression
+            expr: |
+              histogram_quantile(0.95, sum(rate(model_prediction_latency_seconds_bucket{ab_variant="candidate"}[5m])) by (le))
+              >
+              (
+                histogram_quantile(0.95, sum(rate(model_prediction_latency_seconds_bucket{ab_variant="control"}[5m])) by (le))
+                * 1.5
+              )
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: Candidate model p95 latency is significantly worse than control.
+          - alert: RecSysABCandidateTrafficMissing
+            expr: |
+              sum(rate(model_predictions_total{ab_variant="candidate"}[5m])) == 0
+              and sum(rate(model_predictions_total{ab_variant="control"}[5m])) > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: Candidate A/B traffic is missing while control traffic is present.
+          - alert: RecSysABCandidateEmptyResponseSpike
+            expr: |
+              (
+                sum(rate(model_predictions_total{ab_variant="candidate",status="empty"}[5m]))
+                / clamp_min(sum(rate(model_predictions_total{ab_variant="candidate"}[5m])), 0.001)
+              ) > 0.05
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: Candidate model is returning too many empty recommendation responses.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recsys-prometheus
+  namespace: {{ .Values.namespace.name }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: recsys-prometheus
+  template:
+    metadata:
+      annotations:
+        checksum/prometheus-config: {{ printf "%s-%s-%s-%s" .Values.targets.apiNamespace .Values.targets.kserveNamespace .Values.images.prometheus "pod-scrape-v2" | sha256sum | quote }}
+      labels:
+        app: recsys-prometheus
+    spec:
+      serviceAccountName: recsys-prometheus
+      securityContext:
+        fsGroup: 65534
+        fsGroupChangePolicy: OnRootMismatch
+      containers:
+        - name: prometheus
+          image: {{ .Values.images.prometheus }}
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time={{ .Values.retention.prometheus }}
+            - --web.enable-lifecycle
+          ports:
+            - name: http
+              containerPort: 9090
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: recsys-prometheus-config
+        - name: rules
+          configMap:
+            name: recsys-prometheus-rules
+        - name: data
+{{- if .Values.persistence.prometheus.enabled }}
+          persistentVolumeClaim:
+            claimName: recsys-prometheus-data
+{{- else }}
+          emptyDir: {}
+{{- end }}
+{{- if .Values.persistence.prometheus.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: recsys-prometheus-data
+  namespace: {{ .Values.namespace.name }}
+  annotations:
+    "helm.sh/resource-policy": keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.storage.prometheus }}
+{{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: recsys-prometheus
+  namespace: {{ .Values.namespace.name }}
+spec:
+  selector:
+    app: recsys-prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
